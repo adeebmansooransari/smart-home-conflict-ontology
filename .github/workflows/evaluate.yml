@@ -1,0 +1,44 @@
+name: Reproduce Ontology Conflict Evaluation
+
+on:
+  workflow_dispatch: # Enables one-click execution by journal reviewers
+  push:
+    branches: [ main ]
+
+jobs:
+  evaluate-ontologies:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java 17 (Required by Pellet Reasoner)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run SWRL Reasoner & SPARQL Comparison
+        run: |
+          python scripts/evaluate_conflicts.py ontologies/baseline_ontology.owl ontologies/proposed_ontology.owl
+
+      - name: Display Comparison Table in GitHub Summary
+        run: |
+          cat results/summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload CSV Evaluation Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ontology-evaluation-results
+          path: results/
