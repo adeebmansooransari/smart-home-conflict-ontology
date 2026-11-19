@@ -1,157 +1,44 @@
-import re
-import sys
-import tempfile
-import pathlib
-import pandas as pd
-from owlready2 import World, sync_reasoner_pellet
+name: Reproduce Ontology Conflict Evaluation
 
-# Properties to evaluate across Baseline and Proposed ontologies
-SYMMETRIC_METRICS = {
-    "Direct / Cross-Execution Conflicts": ["CrossExecutionConflict", "conflicts"],
-    "Environment Cross-Conflicts": ["EnvironmentCrossConflict", "Environment_Conflicts"],
-    "Environment Redundancy Conflicts": ["EnvironmentRedundancyConflicts"],
-    "Safety Policy Violations": ["SafetyPolicyViolated"],
-    "Direct Loop Rules": ["LoopRules"],
-    "Indirect Loop Rules": ["IndirectLoopRules"],
-}
+on:
+  workflow_dispatch: # Enables one-click execution by journal reviewers
+  push:
+    branches: [ main ]
 
-DIRECTIONAL_METRICS = {
-    "Rule Redundancies": ["RuleRedundancy"],
-    "Configuration Alerts (Room-Level)": ["ConfigAlert"],
-}
+jobs:
+  evaluate-ontologies:
+    runs-on: ubuntu-latest
 
-def sanitize_owl_for_owlready2(owl_path: str) -> str:
-    """
-    1. Converts string-wrapped xsd:time("HH:MM:SS") literals to standard typed xsd:time.
-    2. Disambiguates OWL 2 punning on '#triggers' (declared as both owl:Class and owl:ObjectProperty)
-       so owlready2 can load the ontology cleanly without altering property semantics.
-    """
-    raw = pathlib.Path(owl_path).read_text(encoding="utf-8")
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    # Fix string-wrapped xsd:time literals
-    time_pattern = r'rdf:datatype="http://www\.w3\.org/2000/01/rdf-schema#Literal">xsd:time\("?([0-9:]+)"?\)'
-    fixed = re.sub(
-        time_pattern,
-        r'rdf:datatype="http://www.w3.org/2001/XMLSchema#time">\1',
-        raw
-    )
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    # Disambiguate punned owl:Class '#triggers' -> '#TriggerClass' while preserving owl:ObjectProperty '#triggers'
-    class_punning_pattern = r'<owl:Class rdf:about="([^"]+#)triggers">(.*?)</owl:Class>'
-    fixed = re.sub(
-        class_punning_pattern,
-        r'<owl:Class rdf:about="\1TriggerClass">\2</owl:Class>',
-        fixed,
-        flags=re.DOTALL
-    )
+      - name: Set up Java 25 (Required by Owlready2 Pellet JAR)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".owl", mode="w", encoding="utf-8")
-    tmp.write(fixed)
-    tmp.close()
-    return tmp.name
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
-def evaluate_ontology(owl_path: str, label: str):
-    print(f"\n--- Evaluating {label} ({owl_path}) ---")
-    clean_path = sanitize_owl_for_owlready2(owl_path)
-    
-    # Use an isolated World per ontology so inferences do not bleed across runs
-    world = World()
-    onto = world.get_ontology(f"file://{clean_path}").load()
-    base_iri = onto.base_iri
-    if not base_iri.endswith("#"):
-        base_iri += "#"
+      - name: Run SWRL Reasoner & SPARQL Comparison
+        run: |
+          python scripts/evaluate_conflicts.py ontologies/baseline_ontology.owl ontologies/proposed_ontology.owl
 
-    print("Running Pellet reasoner & SWRL rules...")
-    with onto:
-        sync_reasoner_pellet(world, infer_property_values=True, infer_data_property_values=True)
+      - name: Display Comparison Table in GitHub Summary
+        run: |
+          cat results/summary.md >> $GITHUB_STEP_SUMMARY
 
-    counts = {}
-    detailed_rows = []
-
-    # 1. Query Symmetric Conflict Properties (counted once per unordered pair)
-    for metric_name, prop_candidates in SYMMETRIC_METRICS.items():
-        pair_set = set()
-        for prop in prop_candidates:
-            query = f"""
-                PREFIX : <{base_iri}>
-                SELECT DISTINCT ?x ?y
-                WHERE {{
-                    ?x :{prop} ?y .
-                    FILTER(?x != ?y && STR(?x) < STR(?y))
-                }}
-            """
-            try:
-                for row in world.sparql(query):
-                    x_name = row[0].name if hasattr(row[0], "name") else str(row[0]).split("#")[-1]
-                    y_name = row[1].name if hasattr(row[1], "name") else str(row[1]).split("#")[-1]
-                    pair_set.add((x_name, y_name))
-                    detailed_rows.append({
-                        "Ontology": label,
-                        "Category": metric_name,
-                        "Property": prop,
-                        "Entity_1": x_name,
-                        "Entity_2": y_name
-                    })
-            except Exception:
-                pass
-        counts[metric_name] = len(pair_set)
-
-    # 2. Query Directional Properties
-    for metric_name, prop_candidates in DIRECTIONAL_METRICS.items():
-        pair_set = set()
-        for prop in prop_candidates:
-            query = f"""
-                PREFIX : <{base_iri}>
-                SELECT DISTINCT ?x ?y
-                WHERE {{
-                    ?x :{prop} ?y .
-                    FILTER(?x != ?y)
-                }}
-            """
-            try:
-                for row in world.sparql(query):
-                    x_name = row[0].name if hasattr(row[0], "name") else str(row[0]).split("#")[-1]
-                    y_name = row[1].name if hasattr(row[1], "name") else str(row[1]).split("#")[-1]
-                    pair_set.add((x_name, y_name))
-                    detailed_rows.append({
-                        "Ontology": label,
-                        "Category": metric_name,
-                        "Property": prop,
-                        "Entity_1": x_name,
-                        "Entity_2": y_name
-                    })
-            except Exception:
-                pass
-        counts[metric_name] = len(pair_set)
-
-    counts["Total Detected Conflicts & Violations"] = sum(
-        v for k, v in counts.items() if k != "Configuration Alerts (Room-Level)"
-    )
-    return counts, detailed_rows
-
-if __name__ == "__main__":
-    baseline_file = sys.argv[1]
-    proposed_file = sys.argv[2]
-
-    base_counts, base_details = evaluate_ontology(baseline_file, "Baseline Ontology")
-    prop_counts, prop_details = evaluate_ontology(proposed_file, "Proposed Ontology")
-
-    df_summary = pd.DataFrame([base_counts, prop_counts], index=["Baseline Ontology", "Proposed Ontology"]).T
-    df_summary["Net Improvement / Difference"] = df_summary["Proposed Ontology"] - df_summary["Baseline Ontology"]
-
-    df_details = pd.DataFrame(base_details + prop_details)
-
-    print("\n================ COMPARATIVE EVALUATION RESULTS ================")
-    print(df_summary.to_markdown())
-
-    pathlib.Path("results").mkdir(exist_ok=True)
-    df_summary.to_csv("results/comparison_summary.csv")
-    df_details.to_csv("results/detected_conflict_pairs.csv", index=False)
-
-    with open("results/summary.md", "w", encoding="utf-8") as f:
-        f.write("## Automated SWRL Conflict Detection Comparison\n\n")
-        f.write("### 1. Aggregated Conflict Counts\n\n")
-        f.write(df_summary.to_markdown() + "\n\n")
-        f.write("### 2. Sample Detected Rule Pairs & Policy Violations\n\n")
-        if not df_details.empty:
-            f.write(df_details.to_markdown(index=False) + "\n")
+      - name: Upload CSV Evaluation Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ontology-evaluation-results
+          path: results/
