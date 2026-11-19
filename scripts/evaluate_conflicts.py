@@ -20,15 +20,31 @@ DIRECTIONAL_METRICS = {
     "Configuration Alerts (Room-Level)": ["ConfigAlert"],
 }
 
-def normalize_xsd_time_literals(owl_path: str) -> str:
-    """Converts string-wrapped xsd:time("HH:MM:SS") literals to standard typed xsd:time."""
+def sanitize_owl_for_owlready2(owl_path: str) -> str:
+    """
+    1. Converts string-wrapped xsd:time("HH:MM:SS") literals to standard typed xsd:time.
+    2. Disambiguates OWL 2 punning on '#triggers' (declared as both owl:Class and owl:ObjectProperty)
+       so owlready2 can load the ontology cleanly without altering property semantics.
+    """
     raw = pathlib.Path(owl_path).read_text(encoding="utf-8")
-    pattern = r'rdf:datatype="http://www\.w3\.org/2000/01/rdf-schema#Literal">xsd:time\("?([0-9:]+)"?\)'
+
+    # Fix string-wrapped xsd:time literals
+    time_pattern = r'rdf:datatype="http://www\.w3\.org/2000/01/rdf-schema#Literal">xsd:time\("?([0-9:]+)"?\)'
     fixed = re.sub(
-        pattern,
+        time_pattern,
         r'rdf:datatype="http://www.w3.org/2001/XMLSchema#time">\1',
         raw
     )
+
+    # Disambiguate punned owl:Class '#triggers' -> '#TriggerClass' while preserving owl:ObjectProperty '#triggers'
+    class_punning_pattern = r'<owl:Class rdf:about="([^"]+#)triggers">(.*?)</owl:Class>'
+    fixed = re.sub(
+        class_punning_pattern,
+        r'<owl:Class rdf:about="\1TriggerClass">\2</owl:Class>',
+        fixed,
+        flags=re.DOTALL
+    )
+
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".owl", mode="w", encoding="utf-8")
     tmp.write(fixed)
     tmp.close()
@@ -36,7 +52,7 @@ def normalize_xsd_time_literals(owl_path: str) -> str:
 
 def evaluate_ontology(owl_path: str, label: str):
     print(f"\n--- Evaluating {label} ({owl_path}) ---")
-    clean_path = normalize_xsd_time_literals(owl_path)
+    clean_path = sanitize_owl_for_owlready2(owl_path)
     
     # Use an isolated World per ontology so inferences do not bleed across runs
     world = World()
